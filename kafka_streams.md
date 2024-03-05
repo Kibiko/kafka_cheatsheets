@@ -10,7 +10,10 @@
     * [KTable](#ktables)
 - [Serialisation](#serialisation)
 - [Stateful Operations](#stateful-operations)
-
+    * [Aggregation Example](#aggregation-example)
+- [Windowing](#windowing)
+- [Time Stamps](#time-stamps)
+- [Processor API](#processor-api)
 
 ## Introduction
 
@@ -249,7 +252,7 @@ replication.factor=3
 # Required connection configs for Kafka producer, consumer, and admin
 bootstrap.servers=pkc-4r087.us-west2.gcp.confluent.cloud:9092
 security.protocol=SASL_SSL
-sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username='6R23PZXJALFC4TQN' password='dSVv4T2qBXrkghoQ2pC8foenNvjxh0IP4cVnzq95DspaXxcFhhAnkFLmQ3pxCbkE';
+sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username='[username]' password='[password]';
 sasl.mechanism=PLAIN
 # Required for correctness in Apache Kafka clients prior to 2.6
 client.dns.lookup=use_all_dns_ips
@@ -263,7 +266,7 @@ acks=all
 # Required connection configs for Confluent Cloud Schema Registry
 schema.registry.url=https://psrc-4nrnd.us-central1.gcp.confluent.cloud
 basic.auth.credentials.source=USER_INFO
-basic.auth.user.info=4C4BQ3M5CT2APESY:Od1x6C88iZPUJ4lnjJY4yldhuVUTVEXQCjgnVASD6dcWK6Ia4R2xBAcMox0UnHgn
+basic.auth.user.info=[info]
 ```
 
 ### KStreams
@@ -703,4 +706,382 @@ Considerations:
         - Cache size 
         - Commit interval
         - Set both to zero to see all updates
+
+#### Aggregation Example
+
+```java
+package io.confluent.developer.aggregate;
+
+import io.confluent.developer.StreamsUtils;
+import io.confluent.developer.avro.ElectronicOrder;
+import io.confluent.kafka.streams.serdes.avro.SpecificAvroSerde;
+import org.apache.kafka.common.serialization.Serde;
+import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.streams.KafkaStreams;
+import org.apache.kafka.streams.StreamsBuilder;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.kstream.*;
+
+import java.io.IOException;
+import java.time.Duration;
+import java.util.Map;
+import java.util.Properties;
+import java.util.concurrent.CountDownLatch;
+
+public class StreamsAggregate {
+
+    public static void main(String[] args) throws IOException {
+
+        final Properties streamsProps = StreamsUtils.loadProperties();
+        streamsProps.put(StreamsConfig.APPLICATION_ID_CONFIG, "aggregate-streams");
+
+        StreamsBuilder builder = new StreamsBuilder();
+        final String inputTopic = streamsProps.getProperty("aggregate.input.topic");
+        final String outputTopic = streamsProps.getProperty("aggregate.output.topic");
+        final Map<String, Object> configMap = StreamsUtils.propertiesToMap(streamsProps);
+
+        final SpecificAvroSerde<ElectronicOrder> electronicSerde =
+                StreamsUtils.getSpecificAvroSerde(configMap);
+
+        final KStream<String, ElectronicOrder> electronicStream =
+                builder.stream(inputTopic, Consumed.with(Serdes.String(), electronicSerde))
+                        .peek((key, value) -> System.out.println("Incoming record - key " + key + " value " + value));
+
+        //aggregator that adds the running total
+        //takes in the key, order and produces total
+        Aggregator<String, ElectronicOrder, Double> totalCount =
+                (key, order, total) -> order.getPrice() + total;
+       
+        //groups and aggregates the stream based on aggregator, giving initial double value 0.00
+        electronicStream.groupByKey().aggregate(() -> 0.00,
+                                        totalCount,
+                                        Materialized.with(Serdes.String(), Serdes.Double()))
+                                        .toStream()
+                                        .peek((key, value) -> System.out.println("key " + key + " value " + value))
+                                        .to(outputTopic);
+
+        try (KafkaStreams kafkaStreams = new KafkaStreams(builder.build(), streamsProps)) {
+            final CountDownLatch shutdownLatch = new CountDownLatch(1);
+
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                kafkaStreams.close(Duration.ofSeconds(2));
+                shutdownLatch.countDown();
+            }));
+            TopicLoader.runProducer();
+            try {
+                kafkaStreams.start();
+                shutdownLatch.await();
+            } catch (Throwable e) {
+                System.exit(1);
+            }
+        }
+        System.exit(0);
+    }
+}
+```
+
+## Windowing
+
+Stateful operations will continue unless specified. In order to limit the timing, windowing is used to restrict how long the operation goes on for.
+
+```java
+KStream<String, String> myStream = builder.stream("topic-A");
+myStream.groupByKey().count().toStream().to("output");
+```
+
+This count will count the key and keep going up and up of the entire history.
+
+Windows gives snapshots of an aggregate within a timeframe.
+
+#### Hopping Window
+
+This window has a duration and advance size. The duration indicates the range of the window and the advance size is how that range is advanced. E.g. duration = 5 minutes, advance = 1 minute. This would mean the first window is from 0 to 5 minutes and the second window would be 1 to 6.
+
+```java
+KStream<String, String> myStream = builder.stream("topic-A");
+Duration windowSize = Duration.ofMinutes(5);
+Duration advanceSize = Duration.ofMinutes(1);
+
+TimeWindows hoppingWindow = 
+            TimeWindows.of(windowSize).advanceBy(advanceSize);
+
+myStream.groupByKey()
+        .windowedBy(hoppingWindow)
+        .count();
+```
+
+#### Tumbling Window
+
+Special type of hopping where windowSize = advanceSize. Therefore there are no duplicates. Unique results. No need to declare advance size, only need window size.
+
+#### Session Window
+
+ Not time-driven, window start and end are not fixed. Inactivity gap determines the session window. In the example below, if there are no new events within 5 minutes, the count restarts.
+
+ ```java
+KStream<String, String> myStream = builder.stream("topic-A");
+Duration inactivityGap = Duration.ofMinutes(5);
+
+myStream.groupByKey()
+        .windowedBy(SessionWindows.with(inactivityGap))
+        .count();
+ ```
+
+ E.g user browser sessions, log into site, leave and come back, count session as a whole
+
+ #### Sliding Window
+
+ Similar to hopping with fixed size. But driven by actual events rather than time. Only gives one output result compared to hopping which can have duplicates. What if an event falls outside the fixed time size and a new event comes in. The grace period comes in on any of the windows to allow events after to be aggregated.
+
+```java
+KStream<String, String> myStream = builder.stream("topic-A");
+Duration timeDifference = Duration.ofSeconds(2);
+Duration gracePeriod = Duration.ofMillis(500);
+
+myStream.groupByKey()
+        .windowedBy(SlidingWindows.withTimeDifferenceAndGrace(timeDifference, gracePeriod))
+        .count();
+```
+
+#### Useful Methods
+
+**Suppress**
+
+```java
+.suppress(untilWindowCloses(unbounded()))
+```
+
+Results aren't emitted until the window closes
+
+**Mapping**
+
+When the grouped by key stream is windowed, Kafka Streams wraps the key in a Windowed Class. therefore it is a good idea to extract the underlying key from the Windowed instance
+
+```java
+.map((wk, value) -> KeyValue.pair(wk.key(), value))
+```
+
+### Windowing Example
+
+```java
+package io.confluent.developer.windows;
+
+import io.confluent.developer.StreamsUtils;
+import io.confluent.developer.avro.ElectronicOrder;
+import io.confluent.kafka.streams.serdes.avro.SpecificAvroSerde;
+import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.streams.KafkaStreams;
+import org.apache.kafka.streams.KeyValue;
+import org.apache.kafka.streams.StreamsBuilder;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.kstream.*;
+
+import java.io.IOException;
+import java.time.Duration;
+import java.util.Map;
+import java.util.Properties;
+import java.util.concurrent.CountDownLatch;
+
+import static org.apache.kafka.streams.kstream.Suppressed.*;
+import static org.apache.kafka.streams.kstream.Suppressed.BufferConfig.*;
+
+public class StreamsWindows {
+
+    public static void main(String[] args) throws IOException {
+
+        final Properties streamsProps = StreamsUtils.loadProperties();
+        streamsProps.put(StreamsConfig.APPLICATION_ID_CONFIG, "windowed-streams");
+
+        StreamsBuilder builder = new StreamsBuilder();
+        final String inputTopic = streamsProps.getProperty("windowed.input.topic");
+        final String outputTopic = streamsProps.getProperty("windowed.output.topic");
+        final Map<String, Object> configMap = StreamsUtils.propertiesToMap(streamsProps);
+
+        final SpecificAvroSerde<ElectronicOrder> electronicSerde =
+                StreamsUtils.getSpecificAvroSerde(configMap);
+
+        final KStream<String, ElectronicOrder> electronicStream =
+                builder.stream(inputTopic, Consumed.with(Serdes.String(), electronicSerde))
+                        .peek((key, value) -> System.out.println("Incoming record - key " + key + " value " + value));
+
+        //defined window size and grace period
+        Duration windowSize = Duration.ofMinutes(60);
+        Duration gracePeriod = Duration.ofMinutes(5);
+
+        electronicStream.groupByKey()
+                .windowedBy(TimeWindows.of(windowSize).grace(gracePeriod)) //windowing
+                .aggregate(() -> 0.0,
+                        (key, order, total) -> total + order.getPrice(),
+                        Materialized.with(Serdes.String(), Serdes.Double()))
+                
+                //suppresses emit until window closes
+                .suppress(untilWindowCloses(unbounded()))
+                .toStream()
+                //Key is in Windowed class, therefore use map to extract
+                .map((wk, value) -> KeyValue.pair(wk.key(), value))
+                .peek((key, value) -> System.out.println("Outgoing record - key " + key + " value " + value))
+                .to(outputTopic, Produced.with(Serdes.String(), Serdes.Double()));
+
+        try (KafkaStreams kafkaStreams = new KafkaStreams(builder.build(), streamsProps)) {
+            final CountDownLatch shutdownLatch = new CountDownLatch(1);
+
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                kafkaStreams.close(Duration.ofSeconds(2));
+                shutdownLatch.countDown();
+            }));
+            TopicLoader.runProducer();
+            try {
+                kafkaStreams.start();
+                shutdownLatch.await();
+            } catch (Throwable e) {
+                System.exit(1);
+            }
+        }
+        System.exit(0);
+    }
+}
+```
+
+## Time Stamps
+
+- Event-time - a producer automatically sets this timestamp if user does not. This is the current wall-clock the time of the Producer environment when the event is created
+
+- Ingestion-time - can configure the Kafka broker to set this timestap when an event is appended to the topic. This is the current wall-clock time of the Broker environment
+
+- Kafka streams uses the ***TimestampExtractor*** interface to get timestamp of the event. This by default is the event timestamp. Default extractor is ***FailOnInvalidTimestamp***. A custom TimestampExtractor can be created to use a timestamp that is embedded in the event payload (e.g. the event key or value being the timestamp)
+
+- If a *out-of-order* event is put in, the stream time stays where it is
+
+- Out-of-order events may occur for example when a producer fails and repeats the event. If this event is still within the window, it will be processed. This does not occur if everything is broker time.
+
+![](images/late-record-1.png)
+
+- Late events outside the window and grace period is ignored
+- The balance of the window is speed vs all data available
+
+### Example Timestamp Extractor
+
+```java
+package io.confluent.developer.time;
+
+import io.confluent.developer.StreamsUtils;
+import io.confluent.developer.avro.ElectronicOrder;
+import io.confluent.kafka.streams.serdes.avro.SpecificAvroSerde;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.streams.KafkaStreams;
+import org.apache.kafka.streams.KeyValue;
+import org.apache.kafka.streams.StreamsBuilder;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.kstream.Consumed;
+import org.apache.kafka.streams.kstream.KStream;
+import org.apache.kafka.streams.kstream.Materialized;
+import org.apache.kafka.streams.kstream.Produced;
+import org.apache.kafka.streams.kstream.TimeWindows;
+import org.apache.kafka.streams.processor.TimestampExtractor;
+
+import java.io.IOException;
+import java.time.Duration;
+import java.util.Map;
+import java.util.Properties;
+import java.util.concurrent.CountDownLatch;
+
+public class StreamsTimestampExtractor {
+
+    //implements custom timestamp extractor that overrides the extract method
+    static class OrderTimestampExtractor implements TimestampExtractor {
+        @Override
+        public long extract(ConsumerRecord<Object, Object> record, long partitionTime) {
+            ElectronicOrder order = (ElectronicOrder) record.value();
+            System.out.println("Extracting time of " + order.getTime() + " from " + order);
+            return order.getTime();
+        }
+    }
+
+    public static void main(String[] args) throws IOException {
+
+        final Properties streamsProps = StreamsUtils.loadProperties();
+        streamsProps.put(StreamsConfig.APPLICATION_ID_CONFIG, "extractor-windowed-streams");
+
+        StreamsBuilder builder = new StreamsBuilder();
+        final String inputTopic = streamsProps.getProperty("extractor.input.topic");
+        final String outputTopic = streamsProps.getProperty("extractor.output.topic");
+        final Map<String, Object> configMap = StreamsUtils.propertiesToMap(streamsProps);
+
+        final SpecificAvroSerde<ElectronicOrder> electronicSerde =
+                StreamsUtils.getSpecificAvroSerde(configMap);
+
+        final KStream<String, ElectronicOrder> electronicStream =
+                builder.stream(inputTopic,
+                                Consumed.with(Serdes.String(), electronicSerde)
+                        //consumed with timestamp extractor that is initialised with above
+                        .withTimestampExtractor(new OrderTimestampExtractor()))
+                        .peek((key, value) -> System.out.println("Incoming record - key " + key + " value " + value));
+
+        //sets tumbling window that makes sure no data is missed
+        electronicStream.groupByKey().windowedBy(TimeWindows.of(Duration.ofHours(1)))
+                .aggregate(() -> 0.0,
+                        (key, order, total) -> total + order.getPrice(),
+                        Materialized.with(Serdes.String(), Serdes.Double()))
+                .toStream()
+                .map((wk, value) -> KeyValue.pair(wk.key(), value))
+                .peek((key, value) -> System.out.println("Outgoing record - key " + key + " value " + value))
+                .to(outputTopic, Produced.with(Serdes.String(), Serdes.Double()));
+
+        try (KafkaStreams kafkaStreams = new KafkaStreams(builder.build(), streamsProps)) {
+            final CountDownLatch shutdownLatch = new CountDownLatch(1);
+
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                kafkaStreams.close(Duration.ofSeconds(2));
+                shutdownLatch.countDown();
+            }));
+            TopicLoader.runProducer();
+            try {
+                kafkaStreams.start();
+                shutdownLatch.await();
+            } catch (Throwable e) {
+                System.exit(1);
+            }
+        }
+        System.exit(0);
+    }
+}
+```
+
+## Processor API
+
+So far we have been using DSL to build applications and operators. DSL provides high-level operators that build the topology for you. 
+
+The Processor API allows you to have full control of the node by node. Gives more flexibility.
+
+Gives direct access to state store which allows puts and gets. Can call commit directly. This is a request to commit, signalling Kafka Streams, allowing you to schedule arbitrary operations with Punctuation. This can be through stream time processing or wall clock time.
+
+Steps to build stream applications with Processor API:
+
+- Add source nodes
+- Add N number of processors which are child nodes of source node
+- Optionally create one or more StoreBuilder instances and attack to processing nodes
+- Add sink nodes and make them child node of processor nodes
+
+A StoreBuilder is just an instance which tells this node to attach a state store that can be used when processing events through this node.
+
+Give a node the parent node and it will connect automatically. A parent node can have many children nodes. Vice versa.
+
+### Example Topology Creation
+
+```java
+Topology topology = new Topology();
+
+topology.addSource("source-node", "topicA", "topicB"); //source node reads these topics
+
+topology.addProcessor("custom-processor", new CustomProcessorSupplier(storeName), "source-node"); //second argument initialises the processor, parent node is defined last
+
+topology.addSink("sink-node", "output-topic", "custom-processor")
+```
+
+It is possible to mix in Processor API with Streams DSL through:
+
+- transform
+- transformValues
+- process
 
