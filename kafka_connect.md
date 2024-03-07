@@ -311,7 +311,8 @@ services:
     environment:
       CONNECT_BOOTSTRAP_SERVERS: $BOOTSTRAP_SERVERS #environment variable, endpoint for kc101 cluster
       CONNECT_GROUP_ID: "kc101-connect" #tells what connect cluster to join
-      CONNECT_CONFIG_STORAGE_TOPIC: "_kc101-connect-configs" #internal topics to keep in sync with one another
+      #internal topics to keep in sync with one another
+      CONNECT_CONFIG_STORAGE_TOPIC: "_kc101-connect-configs" 
       CONNECT_OFFSET_STORAGE_TOPIC: "_kc101-connect-offsets"
       CONNECT_STATUS_STORAGE_TOPIC: "_kc101-connect-status"
       CONNECT_REPLICATION_FACTOR: 3
@@ -382,7 +383,8 @@ services:
     environment:
       CONNECT_BOOTSTRAP_SERVERS: $BOOTSTRAP_SERVERS
       CONNECT_GROUP_ID: "kc101-connect"
-      CONNECT_CONFIG_STORAGE_TOPIC: "_kc101-connect-configs"
+      #internal topics the worker nodes use to keep in sync with one another
+      CONNECT_CONFIG_STORAGE_TOPIC: "_kc101-connect-configs" 
       CONNECT_OFFSET_STORAGE_TOPIC: "_kc101-connect-offsets"
       CONNECT_STATUS_STORAGE_TOPIC: "_kc101-connect-status"
       CONNECT_REPLICATION_FACTOR: 3
@@ -701,4 +703,3 @@ In order to manage connectors through the CLI, you can hit the Kafka Connect RES
 
 https://developer.confluent.io/courses/kafka-connect/rest-api/
 
-##
