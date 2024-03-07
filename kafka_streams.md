@@ -9,6 +9,7 @@
     * [KStream](#kstreams)
     * [KTable](#ktables)
 - [Serialisation](#serialisation)
+- [Joins](#joins)
 - [Stateful Operations](#stateful-operations)
     * [Aggregation Example](#aggregation-example)
 - [Windowing](#windowing)
